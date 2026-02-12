@@ -1,11 +1,11 @@
-from flask import Blueprint, request, jsonify, Response
+from flask import Blueprint, request, jsonify
 from datetime import datetime
 import json
 import os
 import sys
 from pathlib import Path
 import pytz
-from io import BytesIO
+import tempfile
 
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -20,6 +20,9 @@ interviews_bp = Blueprint('interviews', __name__, url_prefix='/api/interviews')
 client = None
 
 def get_openai_client():
+    """
+    Initialize OpenAI client with proper configuration to avoid proxy issues.
+    """
     global client
     if client is None:
         try:
@@ -27,10 +30,18 @@ def get_openai_client():
             api_key = os.getenv("OPENAI_API_KEY")
             if not api_key:
                 raise ValueError("OPENAI_API_KEY not set in environment variables")
-            client = OpenAI(api_key=api_key)
-            print("✅ OpenAI client initialized")
+            
+            # Create client with explicit configuration to avoid proxy parameter issues
+            # This works with openai>=1.0.0
+            client = OpenAI(
+                api_key=api_key,
+                timeout=60.0,
+                max_retries=2
+            )
+            print("✅ OpenAI client initialized successfully")
         except Exception as e:
             print(f"❌ Error initializing OpenAI: {e}")
+            print(f"   Make sure you have: pip install openai>=1.0.0")
             raise
     return client
 
@@ -62,13 +73,12 @@ def generate_questions():
             return jsonify({"error": "Interview ID required"}), 400
 
         # 🔐 Interview status validation & atomic lock
-        # This is the CRITICAL part - prevents duplicate interview starts
         from services.mongodb_service import scheduled_interviews
 
         update_result = scheduled_interviews.find_one_and_update(
             {
                 "interview_id": interview_id,
-                "interview_status": "scheduled"  # Only allow if status is "scheduled"
+                "interview_status": "scheduled"
             },
             {
                 "$set": {
@@ -79,7 +89,6 @@ def generate_questions():
         )
 
         if not update_result:
-            # Interview is already started, completed, or doesn't exist
             existing = scheduled_interviews.find_one({"interview_id": interview_id})
             
             if existing:
@@ -149,7 +158,6 @@ JOB DESCRIPTION
 {jd_text}
 """
 
-
         openai_client = get_openai_client()
         response = openai_client.chat.completions.create(
             model="gpt-4o-mini",
@@ -178,7 +186,6 @@ JOB DESCRIPTION
     except Exception as e:
         print(f"Error generating questions: {e}")
         return jsonify({"error": str(e)}), 500
-
 
 
 @interviews_bp.route('/next-question/<interview_id>', methods=['GET'])
@@ -242,84 +249,55 @@ def submit_answer(interview_id):
         return jsonify({"error": str(e)}), 500
 
 
-@interviews_bp.route('/transcribe-audio/<interview_id>', methods=['POST'])
-def transcribe_audio(interview_id):
-    """Transcribe audio using OpenAI Whisper"""
+# ─────────────────────────────────────────────────────────────────────────────
+# ✅ NEW: Whisper STT endpoint — replaces browser SpeechRecognition
+# Frontend records audio, sends it here, gets back a transcript.
+# TTS stays entirely in the browser (speechSynthesis) — zero OpenAI TTS cost.
+# ─────────────────────────────────────────────────────────────────────────────
+@interviews_bp.route('/transcribe', methods=['POST'])
+def transcribe_audio():
+    """
+    Transcribe candidate's spoken answer using OpenAI Whisper.
+    Expects a multipart/form-data POST with:
+        audio  — audio blob (webm/ogg/wav, anything Whisper accepts)
+    """
     try:
         if 'audio' not in request.files:
             return jsonify({"error": "No audio file provided"}), 400
-        
+
         audio_file = request.files['audio']
-        
-        if audio_file.filename == '':
-            return jsonify({"error": "No selected file"}), 400
-        
-        # Get OpenAI client
-        openai_client = get_openai_client()
-        
-        # Transcribe using Whisper
-        # Read the audio file content
-        audio_file.seek(0)
-        
-        # Create a file-like object with a proper name for OpenAI
-        audio_data = audio_file.read()
-        audio_buffer = BytesIO(audio_data)
-        audio_buffer.name = "audio.webm"  # OpenAI needs a filename
-        
-        transcript = openai_client.audio.transcriptions.create(
-            model="whisper-1",
-            file=audio_buffer,
-            language="en"
-        )
-        
-        transcribed_text = transcript.text
-        
-        print(f"✅ Transcribed audio for interview {interview_id}: {transcribed_text[:100]}...")
-        
+
+        # Whisper needs a real file on disk (or a file-like with a name)
+        suffix = '.webm'
+        original_filename = audio_file.filename or ''
+        if '.' in original_filename:
+            suffix = '.' + original_filename.rsplit('.', 1)[-1]
+
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            audio_file.save(tmp.name)
+            tmp_path = tmp.name
+
+        try:
+            openai_client = get_openai_client()
+            with open(tmp_path, 'rb') as f:
+                transcript_response = openai_client.audio.transcriptions.create(
+                    model="whisper-1",
+                    file=f,
+                    language="en"
+                )
+            transcript = transcript_response.text.strip()
+        finally:
+            os.unlink(tmp_path)  # always clean up temp file
+
+        print(f"✅ Whisper transcript: {transcript[:80]}...")
+
         return jsonify({
             "status": "success",
-            "text": transcribed_text
+            "transcript": transcript
         }), 200
-    
-    except Exception as e:
-        print(f"Error transcribing audio: {e}")
-        return jsonify({"error": str(e)}), 500
 
-
-@interviews_bp.route('/text-to-speech', methods=['POST'])
-def text_to_speech():
-    """Convert text to speech using OpenAI TTS"""
-    try:
-        data = request.json
-        text = data.get("text", "").strip()
-        
-        if not text:
-            return jsonify({"error": "Text required"}), 400
-        
-        # Get OpenAI client
-        openai_client = get_openai_client()
-        
-        # Generate speech using TTS
-        response = openai_client.audio.speech.create(
-            model="tts-1",
-            voice="alloy",  # Options: alloy, echo, fable, onyx, nova, shimmer
-            input=text,
-            speed=0.95
-        )
-        
-        # Return audio as binary response
-        audio_content = response.content
-        
-        print(f"✅ Generated TTS audio for text: {text[:100]}...")
-        
-        return Response(
-            audio_content,
-            mimetype="audio/mpeg",
-            headers={"Content-Disposition": "inline; filename=speech.mp3"}
-        )
-    
     except Exception as e:
-        print(f"Error generating speech: {e}")
+        print(f"❌ Transcription error: {e}")
         return jsonify({"error": str(e)}), 500
 
 
@@ -336,14 +314,13 @@ def evaluate_interview(interview_id):
         if not qna:
             return jsonify({"error": "No interview data"}), 400
         
-        # Prepare combined text
         combined_text = ""
         for idx, qa in enumerate(qna, start=1):
             combined_text += f"""
 Q{idx}: {qa['question']}
 A{idx}: {qa['answer']}
 """
-        
+
         prompt = f"""
 You are a senior technical interview evaluator.
 
@@ -422,7 +399,6 @@ Return this JSON format exactly:
 }}
 """
 
-        
         openai_client = get_openai_client()
         response = openai_client.chat.completions.create(
             model="gpt-4o-mini",
@@ -435,7 +411,6 @@ Return this JSON format exactly:
         
         result_text = response.choices[0].message.content.strip()
         
-        # Clean JSON response
         if "```json" in result_text:
             result_text = result_text.split("```json")[1].split("```")[0].strip()
         elif "```" in result_text:
@@ -443,7 +418,6 @@ Return this JSON format exactly:
         
         result = json.loads(result_text)
         
-        # Save to MongoDB
         interview_data = {
             "interview_id": interview_id,
             "timestamp": datetime.utcnow().isoformat(),
@@ -452,7 +426,6 @@ Return this JSON format exactly:
         }
         
         save_interview_result(interview_data)
-        
         print(f"✅ Interview {interview_id} evaluated and saved")
         
         return jsonify(result), 200
@@ -473,14 +446,12 @@ def upload_video(interview_id):
         candidate_name = request.form.get('candidate_name', 'Candidate')
         candidate_email = request.form.get('candidate_email', '')
 
-        
         if video_file.filename == '':
             return jsonify({"error": "No selected file"}), 400
         
         file_content = video_file.read()
         filename = f"Interview_{candidate_name}_{interview_id}.webm"
         
-        # Upload to Google Drive
         result = upload_to_drive(file_content, filename)
 
         from services.mongodb_service import scheduled_interviews
@@ -495,7 +466,6 @@ def upload_video(interview_id):
             }
         )
 
-        
         if result and result.get('id'):
             print(f"✅ Video uploaded to Google Drive: {result.get('id')}")
             return jsonify({
@@ -504,7 +474,6 @@ def upload_video(interview_id):
                 "file_id": result.get('id'),
                 "file_link": result.get('link')
             }), 200
-
         else:
             return jsonify({
                 "status": "error",
@@ -541,7 +510,6 @@ def parse_questions(raw_text):
         if not q:
             continue
         
-        # Remove numbering
         for i in range(len(q)):
             if q[i].isdigit():
                 continue
@@ -552,4 +520,4 @@ def parse_questions(raw_text):
         if q:
             questions.append(q)
     
-    return questions[:5]  # Limit to 5 questions
+    return questions[:5]

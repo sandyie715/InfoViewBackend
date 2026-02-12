@@ -21,6 +21,7 @@ app.config['MAIL_USE_TLS'] = os.getenv('MAIL_USE_TLS', True)
 app.config['MAIL_USERNAME'] = os.getenv('MAIL_USERNAME')
 app.config['MAIL_PASSWORD'] = os.getenv('MAIL_PASSWORD')
 app.config['MAIL_DEFAULT_SENDER'] = os.getenv('MAIL_USERNAME')
+app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024 
 
 # Initialize Mail
 mail = Mail(app)
@@ -32,6 +33,10 @@ from routes.interviews import interviews_bp
 # Register blueprints
 app.register_blueprint(scheduler_bp)
 app.register_blueprint(interviews_bp)
+
+@app.route("/", methods = ['GET'])
+def root():
+    return {"Message": "InfoView Backend is Running."}
 
 @app.route('/api/health', methods=['GET'])
 def health():

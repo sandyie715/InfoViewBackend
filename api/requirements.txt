@@ -1,13 +1,30 @@
-Flask==2.3.3
+# Core Framework
+Flask==3.0.0
 Flask-CORS==4.0.0
 Flask-Mail==0.9.1
-python-dotenv==1.0.0
-gunicorn==21.2.0
+
+# OpenAI for GPT and TTS (Text-to-Speech)
 openai==1.12.0
-pymongo==4.5.0
-pytz==2023.3
-httpx==0.25.0
+
+
+# MongoDB
+pymongo==4.6.1
+
+# Google Drive API
+google-auth==2.27.0
+google-auth-oauthlib==1.2.0
 google-auth-httplib2==0.2.0
-google-auth-oauthlib==1.1.0
-google-api-python-client==2.101.0
-google-auth==2.25.2
+google-api-python-client==2.116.0
+
+# Timezone support
+pytz==2024.1
+
+# Audio processing dependencies (required by faster-whisper)
+# ffmpeg-python==0.2.0  # Optional: if you need ffmpeg wrapper
+
+# Utilities
+python-dotenv==1.0.0
+Werkzeug==3.0.1
+
+# Additional dependencies that might be needed
+requests==2.31.0
