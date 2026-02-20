@@ -3,6 +3,9 @@
 .env.local
 .env.*.local
 
+myvenv310
+
+
 # Python
 __pycache__/
 *.py[cod]

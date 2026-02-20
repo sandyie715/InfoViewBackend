@@ -10,7 +10,7 @@ import tempfile
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from services.mongodb_service import save_interview_result
+from services.mongodb_service import scheduled_interviews
 from services.drive_service import upload_to_drive
 from utils.helpers import parse_iso_datetime
 
@@ -56,7 +56,6 @@ Make questions specific to the job description provided.
 """
 
 # In-memory storage for current interview session
-interview_sessions = {}
 
 @interviews_bp.route('/generate-questions', methods=['POST'])
 def generate_questions():
@@ -171,11 +170,18 @@ JOB DESCRIPTION
         raw_text = response.choices[0].message.content
         questions = parse_questions(raw_text)
 
-        interview_sessions[interview_id] = {
-            "questions": questions,
-            "current_index": 0,
-            "qna": []
-        }
+        scheduled_interviews.update_one(
+            {"interview_id": interview_id},
+            {
+                "$set": {
+                    "questions": questions,
+                    "current_index": 0,
+                    "qna": [],
+                    "interview_status": "in_progress"
+                }
+            }
+        )
+
 
         return jsonify({
             "status": "success",
@@ -192,26 +198,30 @@ JOB DESCRIPTION
 def next_question(interview_id):
     """Get next interview question"""
     try:
-        if interview_id not in interview_sessions:
-            return jsonify({"error": "Interview session not found"}), 404
-        
-        session = interview_sessions[interview_id]
-        current_index = session["current_index"]
-        questions = session["questions"]
-        
+        from services.mongodb_service import scheduled_interviews
+
+        interview = scheduled_interviews.find_one(
+            {"interview_id": interview_id}
+        )
+
+        if not interview:
+            return jsonify({"error": "Interview not found"}), 404
+
+        questions = interview.get("questions", [])
+        current_index = interview.get("current_index", 0)
+
         if current_index >= len(questions):
             return jsonify({"done": True, "question": ""}), 200
-        
+
         question = questions[current_index]
-        session["current_index"] += 1
-        
+
         return jsonify({
             "done": False,
             "question": question,
             "questionNumber": current_index + 1,
             "totalQuestions": len(questions)
         }), 200
-    
+
     except Exception as e:
         print(f"Error getting next question: {e}")
         return jsonify({"error": str(e)}), 500
@@ -221,29 +231,71 @@ def next_question(interview_id):
 def submit_answer(interview_id):
     """Submit answer to a question"""
     try:
-        if interview_id not in interview_sessions:
-            return jsonify({"error": "Interview session not found"}), 404
-        
+        from services.mongodb_service import scheduled_interviews
+
         data = request.json
         question = data.get("question")
         answer = data.get("answer")
-        
+
         if not question or not answer:
             return jsonify({"error": "Question and answer required"}), 400
-        
-        session = interview_sessions[interview_id]
-        session["qna"].append({
-            "question": question,
-            "answer": answer
-        })
-        
+
+        # Step 1: Fetch current state
+        interview = scheduled_interviews.find_one(
+            {"interview_id": interview_id},
+            {"current_index": 1, "questions": 1}
+        )
+
+        if not interview:
+            return jsonify({"error": "Interview not found"}), 404
+
+        current_index = interview.get("current_index", 0)
+        questions = interview.get("questions", [])
+
+        # Guard 1: Prevent answering beyond total questions
+        if current_index >= len(questions):
+            return jsonify({"error": "Interview already completed"}), 400
+
+        # Guard 2: Ensure question matches expected question
+        expected_question = questions[current_index]
+
+        if question != expected_question:
+            return jsonify({
+                "error": "Invalid question submission (possible duplicate or out-of-order request)"
+            }), 409
+
+        # Step 2: Atomic update with index condition
+        result = scheduled_interviews.update_one(
+            {
+                "interview_id": interview_id,
+                "current_index": current_index  # critical guard condition
+            },
+            {
+                "$push": {
+                    "qna": {
+                        "question": question,
+                        "answer": answer
+                    }
+                },
+                "$inc": {
+                    "current_index": 1
+                }
+            }
+        )
+
+        if result.modified_count == 0:
+            # Means another request already incremented index
+            return jsonify({
+                "error": "Duplicate or concurrent submission detected"
+            }), 409
+
         print(f"✅ Answer saved for interview {interview_id}")
-        
+
         return jsonify({
             "status": "success",
             "message": "Answer recorded"
         }), 200
-    
+
     except Exception as e:
         print(f"Error submitting answer: {e}")
         return jsonify({"error": str(e)}), 500
@@ -305,15 +357,18 @@ def transcribe_audio():
 def evaluate_interview(interview_id):
     """Get AI evaluation of interview"""
     try:
-        if interview_id not in interview_sessions:
-            return jsonify({"error": "Interview session not found"}), 404
-        
-        session = interview_sessions[interview_id]
-        qna = session["qna"]
-        
+
+        interview = scheduled_interviews.find_one(
+            {"interview_id": interview_id}
+        )
+
+        if not interview:
+            return jsonify({"error": "Interview not found"}), 404
+
+        qna = interview.get("qna", [])
+
         if not qna:
             return jsonify({"error": "No interview data"}), 400
-        
         combined_text = ""
         for idx, qa in enumerate(qna, start=1):
             combined_text += f"""
@@ -345,9 +400,9 @@ EVALUATION RULES
 3. Scoring Guidelines (0–10):
    - 0–2 → No answer or completely incorrect
    - 3–4 → Very basic or partially relevant understanding
-   - 5–6 → Acceptable, basic understanding with minor gaps
-   - 7–8 → Good, clear, and mostly correct explanation
-   - 9–10 → Very strong, confident, and accurate explanation
+   - 5–8 → Acceptable, basic understanding with minor gaps
+   - 9 -10 → Good, clear, and mostly correct explanation
+   
 
    When in doubt, lean toward the higher reasonable score.
 
@@ -418,16 +473,18 @@ Return this JSON format exactly:
         
         result = json.loads(result_text)
         
-        interview_data = {
-            "interview_id": interview_id,
-            "timestamp": datetime.utcnow().isoformat(),
-            "qna": qna,
-            "evaluation": result
-        }
-        
-        save_interview_result(interview_data)
+        scheduled_interviews.update_one(
+            {"interview_id": interview_id},
+            {
+                "$set": {
+                    "evaluation": result,
+                    "completed_at": datetime.utcnow(),
+                    "interview_status": "completed"
+                }
+            }
+        )
+
         print(f"✅ Interview {interview_id} evaluated and saved")
-        
         return jsonify(result), 200
     
     except Exception as e:
@@ -482,21 +539,6 @@ def upload_video(interview_id):
     
     except Exception as e:
         print(f"Error uploading video: {e}")
-        return jsonify({"error": str(e)}), 500
-
-
-@interviews_bp.route('/cleanup/<interview_id>', methods=['POST'])
-def cleanup_session(interview_id):
-    """Clean up interview session from memory"""
-    try:
-        if interview_id in interview_sessions:
-            del interview_sessions[interview_id]
-            print(f"✅ Cleaned up session for interview {interview_id}")
-        
-        return jsonify({"status": "success"}), 200
-    
-    except Exception as e:
-        print(f"Error cleaning up session: {e}")
         return jsonify({"error": str(e)}), 500
 
 
