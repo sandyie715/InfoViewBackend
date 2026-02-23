@@ -7,6 +7,9 @@ import os
 import sys
 from pathlib import Path
 
+from bson import ObjectId
+from bson.errors import InvalidId
+
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -296,3 +299,81 @@ def send_interview_email(candidate_name, candidate_email, interview_link, start_
     except Exception as e:
         print(f"❌ Email error: {e}")
         raise
+
+IST = pytz.timezone("Asia/Kolkata")
+
+def serialize_doc(doc):
+    """Convert a MongoDB document to a JSON-safe dict."""
+    doc = dict(doc)
+
+    # Convert ObjectId → string
+    if '_id' in doc and isinstance(doc['_id'], ObjectId):
+        doc['_id'] = str(doc['_id'])
+
+    # Convert datetime fields → ISO string + IST display string
+    for field in ['start_time', 'end_time', 'scheduled_at', 'created_at',
+                  'started_at', 'completed_at']:
+        if field in doc and isinstance(doc[field], datetime):
+            utc_dt = doc[field].replace(tzinfo=pytz.utc) if doc[field].tzinfo is None else doc[field]
+            doc[field] = utc_dt.isoformat()
+            # Add human-readable IST version alongside
+            ist_dt = utc_dt.astimezone(IST)
+            doc[f'{field}_ist'] = ist_dt.strftime('%d %b %Y, %I:%M %p IST')
+
+    return doc
+
+
+# ── GET /api/scheduler/all ────────────────────────────────────────────────────
+@scheduler_bp.route('/all', methods=['GET'])
+def get_all_interviews():
+    """
+    Return all scheduled interviews from MongoDB, newest first.
+    Dashboard calls:  GET https://info-view-backend-wblb.vercel.app/api/scheduler/all
+    """
+    try:
+        from services.mongodb_service import scheduled_interviews
+
+        if scheduled_interviews is None:
+            return jsonify({"error": "Database not connected"}), 503
+
+        # Sort by created_at descending (newest first)
+        docs = list(scheduled_interviews.find({}).sort('created_at', -1))
+        interviews = [serialize_doc(doc) for doc in docs]
+
+        return jsonify({"interviews": interviews, "total": len(interviews)}), 200
+
+    except Exception as e:
+        print(f"❌ Error fetching all interviews: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+# ── DELETE /api/scheduler/<interview_id> ──────────────────────────────────────
+@scheduler_bp.route('/<interview_id>', methods=['DELETE'])
+def delete_interview(interview_id):
+    """
+    Delete a single interview by its MongoDB _id string.
+    Dashboard calls:  DELETE https://info-view-backend-wblb.vercel.app/api/scheduler/<_id>
+    """
+    try:
+        from services.mongodb_service import scheduled_interviews
+
+        if scheduled_interviews is None:
+            return jsonify({"error": "Database not connected"}), 503
+
+        # Convert string → ObjectId
+        try:
+            oid = ObjectId(interview_id)
+        except InvalidId:
+            return jsonify({"error": "Invalid interview ID format"}), 400
+
+        result = scheduled_interviews.delete_one({"_id": oid})
+
+        if result.deleted_count == 0:
+            return jsonify({"error": "Interview not found"}), 404
+
+        print(f"✅ Interview deleted: {interview_id}")
+        return jsonify({"status": "success", "deleted_id": interview_id}), 200
+
+    except Exception as e:
+        print(f"❌ Error deleting interview: {e}")
+        return jsonify({"error": str(e)}), 500
